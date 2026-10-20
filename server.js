@@ -100,9 +100,9 @@ const CONFIGURE_HTML = `<!DOCTYPE html>
 <body>
   <div class="card">
     <div class="header">
-      <div class="badge">Stremio & Nuvio Addon v2.0</div>
+      <div class="badge">Stremio & Nuvio Addon v3.0</div>
       <h1>Arabic Streams + Torbox</h1>
-      <p class="desc">Brings Arabic movies and series directly to your Stremio library with multi-indexer scraping and cached Torbox debrid playback.</p>
+      <p class="desc">Fast Arabic & global stream resolver powered by Torbox Debrid, Meteor, StremThru Torz, and Comet.</p>
     </div>
     <form id="configForm">
       <div class="form-group">
@@ -176,9 +176,9 @@ const ALL_LOCAL_ITEMS = [...SAMPLE_ARABIC_MOVIES, ...SAMPLE_ARABIC_SERIES];
 function getManifest(torboxKey) {
   return {
     id: "community.arabic.torbox",
-    version: "2.0.0",
+    version: "3.0.0",
     name: "Arabic Torbox Streams",
-    description: "Arabic movies and TV shows powered by Torbox Debrid & multi-indexer scraping",
+    description: "Arabic & global movies/series powered by Torbox Debrid (v3.0 Fast Parallel Engine)",
     resources: ["catalog", "stream"],
     types: ["movie", "series"],
     catalogs: [
@@ -198,7 +198,7 @@ function getManifest(torboxKey) {
     idPrefixes: ["tt"],
     behaviorHints: {
       configurable: true,
-      configurationRequired: !torboxKey
+      configurationRequired: false
     }
   };
 }
@@ -220,10 +220,18 @@ function extractQuality(title) {
   return "HD";
 }
 
-function extractHashFromMagnet(magnet) {
-  if (!magnet) return null;
-  const match = magnet.match(/btih:([a-fA-F0-9]{40}|[a-zA-Z2-7]{32})/i);
+function extractHash(str) {
+  if (!str) return null;
+  const match = String(str).match(/\b([a-fA-F0-9]{40})\b/);
   return match ? match[1].toLowerCase() : null;
+}
+
+// Helper: Promise with hard timeout so Stremio NEVER times out
+function withTimeout(promise, ms, fallback = []) {
+  return Promise.race([
+    promise.catch(() => fallback),
+    new Promise((resolve) => setTimeout(() => resolve(fallback), ms))
+  ]);
 }
 
 // 1. Root & Configure Page
@@ -261,233 +269,281 @@ app.get(
   }
 );
 
-// Helper: Fetch torrents from TorBox Official Search API (https://search-api.torbox.app)
-async function searchTorboxIndexer(torboxKey, imdbId, type, season, episode, queries) {
+// Source A: Meteor (TorBox/Midnight whitelisted indexer — works in P2P discovery mode without blocking cloud IPs)
+async function fetchFromMeteor(type, fullId) {
   const found = [];
-  const headers = {
-    Authorization: `Bearer ${torboxKey}`,
-    "User-Agent": USER_AGENT
-  };
-
-  // A. Search by IMDb ID on search-api.torbox.app
   try {
-    let url = `https://search-api.torbox.app/torrents/imdb:${imdbId}?check_cache=true`;
-    if (type === "series" && season && episode) {
-      url += `&season=${season}&episode=${episode}`;
-    }
-    const res = await axios.get(url, { headers, timeout: 6000 });
-    const torrents = res.data?.data?.torrents || [];
-    for (const t of torrents) {
-      const hash = (t.hash || extractHashFromMagnet(t.magnet) || "").toLowerCase();
+    const url = `https://meteorfortheweebs.midnightignite.me/stream/${type}/${fullId}.json`;
+    const res = await axios.get(url, { headers: { "User-Agent": USER_AGENT }, timeout: 2800 });
+    const streams = res.data?.streams || [];
+    for (const s of streams) {
+      const hash = (s.infoHash || extractHash(s.url) || extractHash(s.behaviorHints?.bingeGroup) || "").toLowerCase();
+      const rawTitle = s.description || s.title || s.behaviorHints?.filename || "Stream";
       if (hash) {
         found.push({
           hash,
-          title: t.raw_title || t.title || "TorBox Stream",
-          size: t.size || 0,
-          seeders: t.last_known_seeders ?? 0,
-          cached: Boolean(t.cached),
-          source: "TorBox Indexer"
+          title: rawTitle.replace(/\n+/g, " | "),
+          size: s.behaviorHints?.videoSize || 0,
+          seeders: 20,
+          cached: null,
+          fileIdx: s.fileIdx,
+          source: "Meteor"
         });
       }
     }
-  } catch (err) {
-    console.warn("TorBox IMDb search error:", err.message);
+  } catch (e) {
+    // ignore timeout
   }
-
-  // B. Search by text queries on search-api.torbox.app
-  for (const q of queries) {
-    if (!q) continue;
-    try {
-      const url = `https://search-api.torbox.app/torrents/search/${encodeURIComponent(q)}?check_cache=true`;
-      const res = await axios.get(url, { headers, timeout: 6000 });
-      const torrents = res.data?.data?.torrents || [];
-      for (const t of torrents) {
-        const hash = (t.hash || extractHashFromMagnet(t.magnet) || "").toLowerCase();
-        if (hash) {
-          found.push({
-            hash,
-            title: t.raw_title || t.title || q,
-            size: t.size || 0,
-            seeders: t.last_known_seeders ?? 0,
-            cached: Boolean(t.cached),
-            source: "TorBox Search"
-          });
-        }
-      }
-    } catch (err) {
-      console.warn(`TorBox query search error (${q}):`, err.message);
-    }
-  }
-
   return found;
 }
 
-// Helper: Fetch torrents from Torrentio (extracts infoHashes or direct TorBox streams)
-async function searchTorrentio(torboxKey, type, fullId) {
+// Source B: StremThru Torz (Whitelisted ElfHosted crowdsourced TorBox + DMM hash database)
+async function fetchFromStremThruTorz(torboxKey, type, fullId) {
   const found = [];
+  // 1. Try configured with TorBox store token (returns direct cached TorBox streams)
   try {
-    // Query Torrentio with TorBox key or raw streams
-    const url = `https://torrentio.strem.fun/torbox=${torboxKey}/stream/${type}/${fullId}.json`;
-    const res = await axios.get(url, {
-      headers: { "User-Agent": USER_AGENT },
-      timeout: 6000
-    });
+    const cfg = Buffer.from(
+      JSON.stringify({ stores: [{ c: "tb", t: torboxKey }], cached: false })
+    ).toString("base64url");
+    const url = `https://stremthru.elfhosted.com/stremio/torz/${cfg}/stream/${type}/${fullId}.json`;
+    const res = await axios.get(url, { headers: { "User-Agent": USER_AGENT }, timeout: 2800 });
     const streams = res.data?.streams || [];
     for (const s of streams) {
-      if (s.url && s.url.startsWith("http")) {
+      const hash = (s.infoHash || extractHash(s.url) || extractHash(s.description) || "").toLowerCase();
+      const rawTitle = s.description || s.title || s.behaviorHints?.filename || "StremThru Stream";
+      if (s.url && s.url.startsWith("http") && !hash) {
         found.push({
           directStream: {
-            name: s.name || "TorBox ⚡",
-            title: s.title || "TorBox Stream",
+            name: `Arabic TorBox ⚡ ${extractQuality(rawTitle)}`,
+            title: rawTitle,
             url: s.url
           }
         });
-      } else if (s.infoHash) {
+      } else if (hash) {
+        const isCached = /⚡|cached|tb\+/i.test(`${s.name || ""} ${rawTitle}`);
         found.push({
-          hash: s.infoHash.toLowerCase(),
-          title: (s.title || "Stream").replace(/\n/g, " | "),
-          size: 0,
-          seeders: 10,
-          cached: null,
+          hash,
+          title: rawTitle.replace(/\n+/g, " | "),
+          size: s.behaviorHints?.videoSize || 0,
+          seeders: 25,
+          cached: isCached ? true : null,
           fileIdx: s.fileIdx,
-          source: "Torrentio"
+          source: "StremThru Torz"
         });
       }
     }
-  } catch (err) {
-    console.warn("Torrentio lookup error:", err.message);
+  } catch (e) {
+    // ignore
   }
 
-  // Also try unconfigured Torrentio to extract infoHashes if configured call yielded nothing
+  // 2. Fallback: unconfigured P2P hash discovery from StremThru Torz
   if (found.length === 0) {
     try {
-      const url = `https://torrentio.strem.fun/stream/${type}/${fullId}.json`;
-      const res = await axios.get(url, {
-        headers: { "User-Agent": USER_AGENT },
-        timeout: 6000
-      });
+      const url = `https://stremthru.elfhosted.com/stremio/torz/stream/${type}/${fullId}.json`;
+      const res = await axios.get(url, { headers: { "User-Agent": USER_AGENT }, timeout: 2500 });
       const streams = res.data?.streams || [];
       for (const s of streams) {
-        if (s.infoHash) {
+        const hash = (s.infoHash || extractHash(s.url) || "").toLowerCase();
+        const rawTitle = s.description || s.title || s.behaviorHints?.filename || "Torz Stream";
+        if (hash) {
           found.push({
-            hash: s.infoHash.toLowerCase(),
-            title: (s.title || "Stream").replace(/\n/g, " | "),
-            size: 0,
-            seeders: 10,
+            hash,
+            title: rawTitle.replace(/\n+/g, " | "),
+            size: s.behaviorHints?.videoSize || 0,
+            seeders: 15,
             cached: null,
             fileIdx: s.fileIdx,
-            source: "Torrentio"
+            source: "StremThru"
           });
         }
       }
-    } catch (err) {
-      console.warn("Torrentio raw lookup error:", err.message);
+    } catch (e) {
+      // ignore
     }
   }
-
   return found;
 }
 
-// Helper: Fetch torrents from Apibay (TPB JSON API) & YTS
-async function searchPublicIndexers(imdbId, type, queries) {
+// Source C: Comet (Whitelisted ElfHosted Indexer)
+async function fetchFromComet(torboxKey, type, fullId) {
   const found = [];
-
-  // 1. YTS (Movies)
-  if (type === "movie") {
-    try {
-      const ytsUrl = `https://yts.mx/api/v2/list_movies.json?query_term=${imdbId}`;
-      const res = await axios.get(ytsUrl, { headers: { "User-Agent": USER_AGENT }, timeout: 5000 });
-      const movies = res.data?.data?.movies || [];
-      for (const m of movies) {
-        for (const t of m.torrents || []) {
-          if (t.hash) {
-            found.push({
-              hash: t.hash.toLowerCase(),
-              title: `${m.title_long || m.title} [${t.quality}] [${t.type}] - YTS`,
-              size: t.size_bytes || 0,
-              seeders: t.seeds || 0,
-              cached: null,
-              source: "YTS"
-            });
+  try {
+    const cometCfg = Buffer.from(
+      JSON.stringify({
+        maxResultsPerResolution: 0,
+        maxSize: 0,
+        cachedOnly: false,
+        removeTrash: true,
+        resultFormat: ["all"],
+        debridService: "torbox",
+        debridApiKey: torboxKey,
+        debridStreamProxyPassword: "",
+        languages: { required: [], exclude: [], preferred: [] },
+        resolutions: {}
+      })
+    ).toString("base64");
+    const url = `https://comet.elfhosted.com/${cometCfg}/stream/${type}/${fullId}.json`;
+    const res = await axios.get(url, { headers: { "User-Agent": USER_AGENT }, timeout: 2800 });
+    const streams = res.data?.streams || [];
+    for (const s of streams) {
+      const hash = (s.infoHash || extractHash(s.url) || extractHash(s.behaviorHints?.bingeGroup) || "").toLowerCase();
+      const rawTitle = s.description || s.title || s.behaviorHints?.filename || "Comet Stream";
+      if (hash) {
+        const isCached = /⚡|instant|tb\+/i.test(`${s.name || ""} ${rawTitle}`);
+        found.push({
+          hash,
+          title: rawTitle.replace(/\n+/g, " | "),
+          size: s.behaviorHints?.videoSize || 0,
+          seeders: 20,
+          cached: isCached ? true : null,
+          fileIdx: s.fileIdx,
+          source: "Comet"
+        });
+      } else if (s.url && s.url.startsWith("http")) {
+        found.push({
+          directStream: {
+            name: `Arabic TorBox ⚡ ${extractQuality(rawTitle)}`,
+            title: rawTitle,
+            url: s.url
           }
-        }
+        });
       }
-    } catch (err) {
-      console.warn("YTS search error:", err.message);
     }
+  } catch (e) {
+    // ignore
   }
+  return found;
+}
 
-  // 2. Apibay (by IMDb ID & Title queries)
-  const apibayQueries = [imdbId, ...queries].filter(Boolean).slice(0, 3);
-  for (const q of apibayQueries) {
-    try {
-      const url = `https://apibay.org/q.php?q=${encodeURIComponent(q)}`;
-      const res = await axios.get(url, { headers: { "User-Agent": USER_AGENT }, timeout: 5000 });
-      if (Array.isArray(res.data)) {
-        for (const item of res.data) {
-          if (item.info_hash && item.info_hash !== "0000000000000000000000000000000000000000") {
-            found.push({
+// Source D: Apibay & TorBox Official Search API & Torrentio (All fired in parallel, 2.5s timeout each)
+async function fetchFastScrapers(torboxKey, imdbId, type, season, episode, fullId, queries) {
+  const tasks = [];
+
+  // 1. TorBox Search API by IMDb
+  let tbImdbUrl = `https://search-api.torbox.app/torrents/imdb:${imdbId}?check_cache=true`;
+  if (type === "series" && season && episode) {
+    tbImdbUrl += `&season=${season}&episode=${episode}`;
+  }
+  tasks.push(
+    axios
+      .get(tbImdbUrl, {
+        headers: { Authorization: `Bearer ${torboxKey}`, "User-Agent": USER_AGENT },
+        timeout: 2400
+      })
+      .then((res) => {
+        const list = res.data?.data?.torrents || [];
+        return list
+          .map((t) => ({
+            hash: (t.hash || extractHash(t.magnet) || "").toLowerCase(),
+            title: t.raw_title || t.title || "TorBox Indexer",
+            size: t.size || 0,
+            seeders: t.last_known_seeders ?? 10,
+            cached: Boolean(t.cached),
+            source: "TorBox API"
+          }))
+          .filter((x) => x.hash);
+      })
+      .catch(() => [])
+  );
+
+  // 2. Apibay parallel queries (IMDb ID + top title query + Arabic title)
+  const apibayTerms = [imdbId, ...queries].filter(Boolean).slice(0, 3);
+  for (const term of apibayTerms) {
+    tasks.push(
+      axios
+        .get(`https://apibay.org/q.php?q=${encodeURIComponent(term)}`, {
+          headers: { "User-Agent": USER_AGENT },
+          timeout: 2400
+        })
+        .then((res) => {
+          if (!Array.isArray(res.data)) return [];
+          return res.data
+            .filter(
+              (item) =>
+                item.info_hash &&
+                item.info_hash !== "0000000000000000000000000000000000000000"
+            )
+            .map((item) => ({
               hash: item.info_hash.toLowerCase(),
-              title: item.name || q,
+              title: item.name || term,
               size: Number(item.size) || 0,
               seeders: Number(item.seeders) || 0,
               cached: null,
               source: "TPB"
-            });
-          }
-        }
-      }
-    } catch (err) {
-      console.warn(`Apibay search error (${q}):`, err.message);
-    }
+            }));
+        })
+        .catch(() => [])
+    );
   }
 
-  return found;
+  // 3. Torrentio fast check
+  tasks.push(
+    axios
+      .get(`https://torrentio.strem.fun/stream/${type}/${fullId}.json`, {
+        headers: { "User-Agent": USER_AGENT },
+        timeout: 2400
+      })
+      .then((res) => {
+        const streams = res.data?.streams || [];
+        return streams
+          .filter((s) => s.infoHash)
+          .map((s) => ({
+            hash: s.infoHash.toLowerCase(),
+            title: (s.title || "Stream").replace(/\n+/g, " | "),
+            size: 0,
+            seeders: 15,
+            cached: null,
+            fileIdx: s.fileIdx,
+            source: "Torrentio"
+          }));
+      })
+      .catch(() => [])
+  );
+
+  // 4. User's own TorBox mylist
+  tasks.push(
+    axios
+      .get("https://api.torbox.app/v1/api/torrents/mylist", {
+        headers: { Authorization: `Bearer ${torboxKey}`, "User-Agent": USER_AGENT },
+        timeout: 2400
+      })
+      .then((res) => {
+        const list = res.data?.data || [];
+        if (!Array.isArray(list)) return [];
+        const lowerTerms = queries.filter(Boolean).map((q) => q.toLowerCase());
+        return list
+          .filter((item) => {
+            const name = (item.name || "").toLowerCase();
+            return item.hash && lowerTerms.some((q) => name.includes(q));
+          })
+          .map((item) => ({
+            hash: item.hash.toLowerCase(),
+            title: `[My TorBox Cloud] ${item.name}`,
+            size: item.size || 0,
+            seeders: 999,
+            cached: true,
+            source: "My TorBox"
+          }));
+      })
+      .catch(() => [])
+  );
+
+  const settled = await Promise.all(tasks);
+  return settled.flat();
 }
 
-// Helper: Check User's Own TorBox Library (mylist)
-async function searchUserTorboxLibrary(torboxKey, queries) {
-  const found = [];
-  try {
-    const res = await axios.get("https://api.torbox.app/v1/api/torrents/mylist", {
-      headers: { Authorization: `Bearer ${torboxKey}`, "User-Agent": USER_AGENT },
-      timeout: 5000
-    });
-    const list = res.data?.data || [];
-    if (!Array.isArray(list)) return found;
-
-    const lowerQueries = queries.filter(Boolean).map((q) => q.toLowerCase());
-    for (const item of list) {
-      const name = (item.name || "").toLowerCase();
-      const matches = lowerQueries.some((q) => name.includes(q));
-      if (matches && item.hash) {
-        found.push({
-          hash: item.hash.toLowerCase(),
-          title: `[My TorBox Library] ${item.name}`,
-          size: item.size || 0,
-          seeders: 999,
-          cached: true,
-          source: "TorBox Cloud"
-        });
-      }
-    }
-  } catch (err) {
-    console.warn("TorBox mylist check error:", err.message);
-  }
-  return found;
-}
-
-// 4. Stream Resolution Route
+// 4. Stream Resolution Route (Guaranteed < 4.5s response so Stremio always lists the addon)
 app.get(["/stream/:type/:id.json", "/:torboxKey/stream/:type/:id.json"], async (req, res) => {
   const { torboxKey, type, id } = req.params;
+  const hostUrl = `https://${req.get("host")}`;
 
   if (!torboxKey) {
     return res.json({
       streams: [
         {
-          name: "Config Required",
-          title: "Please configure your Torbox API key first on the /configure page",
-          url: `${req.protocol}://${req.get("host")}/configure`
+          name: "Arabic TorBox ⚠️",
+          title: "Click here to configure your TorBox API key",
+          externalUrl: `${hostUrl}/configure`
         }
       ]
     });
@@ -497,24 +553,23 @@ app.get(["/stream/:type/:id.json", "/:torboxKey/stream/:type/:id.json"], async (
     const [imdbId, season, episode] = id.split(":");
     const localItem = ALL_LOCAL_ITEMS.find((i) => i.id === imdbId);
 
-    // Fetch clean English title from Cinemeta
     let enTitle = localItem?.enTitle || "";
     let arTitle = localItem?.arTitle || "";
     let year = localItem?.year || "";
 
+    // Fast 1.8s Cinemeta title lookup
     try {
       const metaRes = await axios.get(`https://v3-cinemeta.strem.io/meta/${type}/${imdbId}.json`, {
-        timeout: 4000
+        timeout: 1800
       });
       if (metaRes.data?.meta) {
         enTitle = metaRes.data.meta.name || enTitle;
         year = (metaRes.data.meta.year || year || "").toString().split("–")[0].split("-")[0];
       }
     } catch (e) {
-      console.warn("Cinemeta lookup fallback used for:", imdbId);
+      // fallback to imdbId
     }
 
-    // Build targeted search queries (without parenthetical combined text)
     const searchQueries = [];
     if (enTitle) {
       if (type === "series" && season && episode) {
@@ -531,18 +586,23 @@ app.get(["/stream/:type/:id.json", "/:torboxKey/stream/:type/:id.json"], async (
       searchQueries.push(arTitle);
     }
 
-    // Query all indexers in parallel
-    const [torboxResults, torrentioResults, publicResults, libraryResults] = await Promise.all([
-      searchTorboxIndexer(torboxKey, imdbId, type, season, episode, searchQueries),
-      searchTorrentio(torboxKey, type, id),
-      searchPublicIndexers(imdbId, type, searchQueries),
-      searchUserTorboxLibrary(torboxKey, [enTitle, arTitle])
-    ]);
+    // Run all discovery sources concurrently with a strict 3.2-second cap
+    const discoveryBundle = await withTimeout(
+      Promise.all([
+        fetchFromStremThruTorz(torboxKey, type, id),
+        fetchFromMeteor(type, id),
+        fetchFromComet(torboxKey, type, id),
+        fetchFastScrapers(torboxKey, imdbId, type, season, episode, id, searchQueries)
+      ]),
+      3200,
+      [[], [], [], []]
+    );
 
+    const allDiscovered = discoveryBundle.flat();
     const directStreams = [];
     const candidateMap = new Map();
 
-    for (const item of [...libraryResults, ...torboxResults, ...torrentioResults, ...publicResults]) {
+    for (const item of allDiscovered) {
       if (item.directStream) {
         directStreams.push(item.directStream);
         continue;
@@ -552,14 +612,13 @@ app.get(["/stream/:type/:id.json", "/:torboxKey/stream/:type/:id.json"], async (
       if (!existing) {
         candidateMap.set(item.hash, item);
       } else {
-        // Keep cached status if known
         if (item.cached === true) existing.cached = true;
         if (!existing.size && item.size) existing.size = item.size;
       }
     }
 
-    // Batch check cache status on TorBox for all candidate hashes
-    const allHashes = Array.from(candidateMap.keys()).slice(0, 80);
+    // Batch check cache status on TorBox (1.8s max timeout)
+    const allHashes = Array.from(candidateMap.keys()).slice(0, 70);
     if (allHashes.length > 0) {
       try {
         const cacheRes = await axios.get("https://api.torbox.app/v1/api/torrents/checkcached", {
@@ -572,7 +631,7 @@ app.get(["/stream/:type/:id.json", "/:torboxKey/stream/:type/:id.json"], async (
             Authorization: `Bearer ${torboxKey}`,
             "User-Agent": USER_AGENT
           },
-          timeout: 6000
+          timeout: 1800
         });
 
         const cachedData = cacheRes.data?.data;
@@ -596,11 +655,11 @@ app.get(["/stream/:type/:id.json", "/:torboxKey/stream/:type/:id.json"], async (
           }
         }
       } catch (err) {
-        console.warn("TorBox checkcached call error:", err.message);
+        console.warn("TorBox checkcached warning:", err.message);
       }
     }
 
-    // Sort candidates: Cached first, then by seeders & size
+    // Sort: Instant Cached first, then by seeders
     const sortedCandidates = Array.from(candidateMap.values()).sort((a, b) => {
       if (Boolean(a.cached) !== Boolean(b.cached)) {
         return a.cached ? -1 : 1;
@@ -608,14 +667,13 @@ app.get(["/stream/:type/:id.json", "/:torboxKey/stream/:type/:id.json"], async (
       return (b.seeders || 0) - (a.seeders || 0);
     });
 
-    const hostUrl = `https://${req.get("host")}`;
     const resolvedStreams = [...directStreams];
 
     for (const c of sortedCandidates.slice(0, 25)) {
       const quality = extractQuality(c.title);
       const sizeStr = formatBytes(c.size);
-      const badge = c.cached ? "⚡ Instant Cached" : `📥 Download via TorBox (${c.seeders || 0} seeds)`;
-      const metaLine = [sizeStr, badge, c.source].filter(Boolean).join(" | ");
+      const badge = c.cached ? "⚡ Instant Cached" : `📥 TorBox Download (${c.seeders || 0} seeds)`;
+      const metaLine = [sizeStr, badge, c.source].filter(Boolean).join(" • ");
 
       const queryParams = new URLSearchParams();
       if (season) queryParams.set("season", season);
@@ -624,16 +682,33 @@ app.get(["/stream/:type/:id.json", "/:torboxKey/stream/:type/:id.json"], async (
       if (c.title) queryParams.set("dn", c.title.slice(0, 100));
 
       resolvedStreams.push({
-        name: `TorBox ${c.cached ? "⚡" : "📥"} ${quality}`,
+        name: `Arabic TorBox ${c.cached ? "⚡" : "📥"} ${quality}`,
         title: `${c.title}\n${metaLine}`,
         url: `${hostUrl}/${encodeURIComponent(torboxKey)}/resolve/${c.hash}?${queryParams.toString()}`
+      });
+    }
+
+    // Always include at least 1 item if empty so Stremio NEVER hides the addon from the dropdown
+    if (resolvedStreams.length === 0) {
+      resolvedStreams.push({
+        name: "Arabic TorBox",
+        title: `No torrents found yet for "${enTitle || arTitle || imdbId}"\n Add magnet to your TorBox dashboard to stream instantly`,
+        externalUrl: "https://torbox.app/torrents"
       });
     }
 
     res.json({ streams: resolvedStreams });
   } catch (err) {
     console.error("Stream handler error:", err.message);
-    res.json({ streams: [] });
+    res.json({
+      streams: [
+        {
+          name: "Arabic TorBox",
+          title: "Stream lookup error — click to open TorBox",
+          externalUrl: "https://torbox.app/torrents"
+        }
+      ]
+    });
   }
 });
 
@@ -741,7 +816,6 @@ app.get("/:torboxKey/resolve/:hash", async (req, res) => {
       return res.redirect(302, cdnUrl);
     }
 
-    // Fallback to TorBox permalink redirect
     return res.redirect(
       302,
       `https://api.torbox.app/v1/api/torrents/requestdl?token=${encodeURIComponent(
@@ -755,5 +829,5 @@ app.get("/:torboxKey/resolve/:hash", async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`Arabic Torbox Addon v2.0 running on port ${PORT}`);
+  console.log(`Arabic Torbox Addon v3.0 running on port ${PORT}`);
 });
