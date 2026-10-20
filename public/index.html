@@ -1,0 +1,203 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Arabic Content + Torbox - Stremio Addon</title>
+  <style>
+    :root {
+      --bg: #0f111a;
+      --card-bg: #1a1d2e;
+      --accent: #6c5ce7;
+      --accent-hover: #5849d6;
+      --text: #ffffff;
+      --text-muted: #8e94b2;
+      --border: #2a2e45;
+      --success: #00b894;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      background-color: var(--bg);
+      color: var(--text);
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      min-height: 100vh;
+      padding: 20px;
+    }
+    .card {
+      background: var(--card-bg);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 36px;
+      max-width: 480px;
+      width: 100%;
+      box-shadow: 0 12px 30px rgba(0, 0, 0, 0.4);
+    }
+    .header {
+      text-align: center;
+      margin-bottom: 28px;
+    }
+    .badge {
+      display: inline-block;
+      background: rgba(108, 92, 231, 0.2);
+      color: var(--accent);
+      padding: 4px 12px;
+      border-radius: 20px;
+      font-size: 13px;
+      font-weight: 600;
+      margin-bottom: 12px;
+    }
+    h1 {
+      font-size: 24px;
+      margin-bottom: 8px;
+      font-weight: 700;
+    }
+    p.desc {
+      color: var(--text-muted);
+      font-size: 14px;
+      line-height: 1.5;
+    }
+    .form-group {
+      margin-bottom: 20px;
+    }
+    label {
+      display: block;
+      font-size: 14px;
+      font-weight: 500;
+      margin-bottom: 8px;
+      color: var(--text);
+    }
+    input[type="text"], input[type="password"] {
+      width: 100%;
+      padding: 12px 14px;
+      background: #111322;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      color: white;
+      font-size: 14px;
+      outline: none;
+      transition: border-color 0.2s;
+    }
+    input[type="text"]:focus, input[type="password"]:focus {
+      border-color: var(--accent);
+    }
+    .hint {
+      font-size: 12px;
+      color: var(--text-muted);
+      margin-top: 6px;
+    }
+    .hint a {
+      color: var(--accent);
+      text-decoration: none;
+    }
+    .hint a:hover {
+      text-decoration: underline;
+    }
+    .buttons {
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      margin-top: 24px;
+    }
+    .btn {
+      width: 100%;
+      padding: 14px;
+      border-radius: 8px;
+      font-size: 15px;
+      font-weight: 600;
+      cursor: pointer;
+      text-align: center;
+      border: none;
+      transition: background 0.2s, transform 0.1s;
+      text-decoration: none;
+    }
+    .btn:active {
+      transform: scale(0.98);
+    }
+    .btn-primary {
+      background: var(--accent);
+      color: white;
+    }
+    .btn-primary:hover {
+      background: var(--accent-hover);
+    }
+    .btn-secondary {
+      background: #25293f;
+      color: white;
+    }
+    .btn-secondary:hover {
+      background: #2f3450;
+    }
+    .copy-status {
+      font-size: 12px;
+      text-align: center;
+      color: var(--success);
+      min-height: 18px;
+    }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="header">
+      <div class="badge">Stremio & Nuvio Addon</div>
+      <h1>Arabic Streams + Torbox</h1>
+      <p class="desc">Brings Arabic movies and series directly to your Stremio library with fast, cached Torbox debrid playback.</p>
+    </div>
+
+    <form id="configForm">
+      <div class="form-group">
+        <label for="apiKey">Torbox API Key</label>
+        <input type="password" id="apiKey" placeholder="Paste your Torbox API key here..." required autocomplete="off">
+        <p class="hint">Find your API key in <a href="https://torbox.app/settings" target="_blank" rel="noopener">Torbox Settings</a>.</p>
+      </div>
+
+      <div class="buttons">
+        <button type="submit" class="btn btn-primary" id="installBtn">Install in Stremio</button>
+        <button type="button" class="btn btn-secondary" id="copyBtn">Copy Manifest URL</button>
+        <div class="copy-status" id="copyStatus"></div>
+      </div>
+    </form>
+  </div>
+
+  <script>
+    const form = document.getElementById("configForm");
+    const apiKeyInput = document.getElementById("apiKey");
+    const copyBtn = document.getElementById("copyBtn");
+    const copyStatus = document.getElementById("copyStatus");
+
+    function getManifestUrl() {
+      const key = apiKeyInput.value.trim();
+      const origin = window.location.origin;
+      return `${origin}/${encodeURIComponent(key)}/manifest.json`;
+    }
+
+    form.addEventListener("submit", (e) => {
+      e.preventDefault();
+      const key = apiKeyInput.value.trim();
+      if (!key) return;
+
+      const manifestUrl = getManifestUrl().replace(/^https?:\/\//, "");
+      // Open in Stremio protocol
+      window.location.href = `stremio://${manifestUrl}`;
+    });
+
+    copyBtn.addEventListener("click", () => {
+      const key = apiKeyInput.value.trim();
+      if (!key) {
+        apiKeyInput.focus();
+        copyStatus.textContent = "Please enter your Torbox API key first.";
+        copyStatus.style.color = "#ff7675";
+        return;
+      }
+      const manifestUrl = getManifestUrl();
+      navigator.clipboard.writeText(manifestUrl).then(() => {
+        copyStatus.textContent = "Manifest URL copied to clipboard!";
+        copyStatus.style.color = "var(--success)";
+        setTimeout(() => { copyStatus.textContent = ""; }, 3000);
+      });
+    });
+  </script>
+</body>
+</html>
